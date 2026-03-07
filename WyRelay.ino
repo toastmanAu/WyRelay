@@ -159,6 +159,47 @@ static void process_update(JsonObject &update)
         status += "Signal: " + String(WiFi.RSSI()) + " dBm";
         tg_send(chat_id, status);
 
+    } else if (text.startsWith("/key ")) {
+        String combo = text.substring(5);
+        combo.toLowerCase();
+        bool ctrl  = combo.indexOf("ctrl")  >= 0;
+        bool alt   = combo.indexOf("alt")   >= 0;
+        bool shift = combo.indexOf("shift") >= 0;
+        bool super_ = combo.indexOf("super") >= 0 || combo.indexOf("win") >= 0 || combo.indexOf("cmd") >= 0;
+        // Find the actual key (last token after +)
+        int last_plus = combo.lastIndexOf("+");
+        String key_str = (last_plus >= 0) ? combo.substring(last_plus + 1) : combo;
+        key_str.trim();
+        uint8_t key = 0;
+        if      (key_str == "t")      key = 't';
+        else if (key_str == "c")      key = 'c';
+        else if (key_str == "v")      key = 'v';
+        else if (key_str == "z")      key = 'z';
+        else if (key_str == "a")      key = 'a';
+        else if (key_str == "x")      key = 'x';
+        else if (key_str == "f4")     key = KEY_F4;
+        else if (key_str == "f5")     key = KEY_F5;
+        else if (key_str == "tab")    key = KEY_TAB;
+        else if (key_str == "esc")    key = KEY_ESC;
+        else if (key_str == "space")  key = ' ';
+        else if (key_str == "up")     key = KEY_UP_ARROW;
+        else if (key_str == "down")   key = KEY_DOWN_ARROW;
+        else if (key_str == "left")   key = KEY_LEFT_ARROW;
+        else if (key_str == "right")  key = KEY_RIGHT_ARROW;
+        else if (key_str.length()==1) key = key_str[0];
+        if (key) {
+            if (ctrl)   Keyboard.press(KEY_LEFT_CTRL);
+            if (alt)    Keyboard.press(KEY_LEFT_ALT);
+            if (shift)  Keyboard.press(KEY_LEFT_SHIFT);
+            if (super_) Keyboard.press(KEY_LEFT_GUI);
+            Keyboard.press(key);
+            delay(100);
+            Keyboard.releaseAll();
+            tg_send(chat_id, "⌨️ Key sent: " + combo);
+        } else {
+            tg_send(chat_id, "❓ Unknown key: " + key_str);
+        }
+
     } else if (text == "/help") {
         tg_send(chat_id,
             "WyRelay commands:\n"
@@ -166,6 +207,10 @@ static void process_update(JsonObject &update)
             "/type <text> — type only\n"
             "/enter — press Enter\n"
             "/paste — retype last /type\n"
+            "/key <combo> — send key combo\n"
+            "  e.g. /key ctrl+alt+t\n"
+            "  e.g. /key ctrl+c\n"
+            "  e.g. /key super\n"
             "/status — IP + uptime\n"
             "/help — this message"
         );
