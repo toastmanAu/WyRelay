@@ -1,0 +1,17 @@
+[Unit]
+Description=WyRelay Daemon — Telegram shell bridge
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+ExecStart=/usr/bin/python3 /opt/wyrelay/wyrelay-daemon.py \
+    --port /dev/ttyACM0 \
+    --token YOUR_BOT_TOKEN \
+    --chat YOUR_CHAT_ID
+Restart=always
+RestartSec=5
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=multi-user.target
