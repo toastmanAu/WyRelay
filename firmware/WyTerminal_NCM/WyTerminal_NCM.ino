@@ -33,7 +33,7 @@
 #include <Arduino_GFX_Library.h>
 #include "libssh_esp32.h"
 #include <libssh/libssh.h>
-#include "SPIFFS.h"
+#include "FFat.h"
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 #define WIFI_SSID        "D-Link the router"
@@ -224,11 +224,11 @@ void hid_key(const String&combo){
 // Generate ed25519 keypair on first boot, store in SPIFFS.
 // Exports the public key blob into s_pubkey_b64.
 static void init_ssh_keys(){
-    if(!SPIFFS.begin(true)){
+    if(!FFat.begin(true, "/spiffs")){
         term_err("SPIFFS mount fail"); return;
     }
     ssh_key privkey = NULL;
-    bool have_key = SPIFFS.exists(SSH_KEY_PATH);
+    bool have_key = FFat.exists(SSH_KEY_PATH);
     if(have_key){
         int rc = ssh_pki_import_privkey_file(SSH_KEY_PATH, NULL, NULL, NULL, &privkey);
         if(rc != SSH_OK){ have_key = false; privkey = NULL; }
