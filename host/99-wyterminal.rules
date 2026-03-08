@@ -1,0 +1,6 @@
+# /etc/udev/rules.d/99-wyterminal.rules
+# Auto-configures WyTerminal target on USB plug-in.
+# Matches LilyGO T-Display S3 AMOLED (ESP32-S3, VID:PID 303a:1001)
+
+ACTION=="add", SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", \
+    RUN+="/bin/bash -c '/usr/local/bin/wyterminal-hello.sh /dev/%k > /tmp/wyterminal-hello.log 2>&1 &'"

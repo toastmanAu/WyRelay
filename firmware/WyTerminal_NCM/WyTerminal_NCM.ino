@@ -1,12 +1,25 @@
 /*
- * WyTerminal v4 — LilyGO T-Display S3 AMOLED
+ * WyTerminal v4.1 — LilyGO T-Display S3 AMOLED
  * USB HID Keyboard + WiFi Telegram + Onboard SSH
  *
- * v4: /shell <cmd> executes on any SSH target directly from the board.
- *     No Pi relay needed. Board SSHes to target over WiFi.
- *     /target user@host[:port] — switch SSH target
- *     /ssh_pass <password>     — set SSH password for current target
- *     /shell <cmd>             — run command on target, reply via Telegram
+ * v4.1 additions over v4:
+ *   - Auto target discovery: board sends WYTERMINAL_HELLO on CDC connect;
+ *     host udev script replies TARGET user@ip — board sets as active target
+ *   - /screenshot — SSH to target, capture screen, send as Telegram photo
+ *
+ * Commands:
+ *   /run <text>        — HID type + enter
+ *   /type <text>       — HID type (no enter)
+ *   /enter             — press Enter
+ *   /paste             — retype last /type text
+ *   /key <combo>       — key combos (ctrl+c, ctrl+alt+t, etc.)
+ *   /clear             — clear display
+ *   /shell <cmd>       — SSH exec on current target
+ *   /screenshot        — capture target screen, send as photo
+ *   /target user@host  — switch SSH target
+ *   /ssh_pass <pass>   — set SSH password for current target
+ *   /status            — show status
+ *   /help              — command list
  *
  * Board: LilyGo T-Display-S3, USB-OTG TinyUSB, CDC On Boot: Enabled
  * FQBN:  esp32:esp32:lilygo_t_display_s3:USBMode=default,CDCOnBoot=cdc
@@ -18,8 +31,6 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <Arduino_GFX_Library.h>
-
-// LibSSH-ESP32
 #include "libssh_esp32.h"
 #include <libssh/libssh.h>
 
@@ -29,11 +40,23 @@
 #define BOT_TOKEN        "8688942400:AAFZKipOJnzroUWAea-zZuhZbLbRTiAluLM"
 #define ALLOWED_CHAT_ID  1790655432LL
 
-// Default SSH target — override with /target
+// Fallback SSH target (overridden by auto-discovery or /target)
 #define DEFAULT_SSH_USER "orangepi"
 #define DEFAULT_SSH_HOST "192.168.68.87"
 #define DEFAULT_SSH_PORT 22
-#define DEFAULT_SSH_PASS ""   // blank = try publickey then ask
+#define DEFAULT_SSH_PASS ""
+
+// Screenshot: command run on target to capture screen to a temp file
+// Tries gnome-screenshot (Wayland/X), falls back to scrot (X11)
+#define SHOT_CMD \
+  "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus " \
+  "gnome-screenshot -f /tmp/wyt-shot.png 2>/dev/null || " \
+  "scrot /tmp/wyt-shot.png 2>/dev/null || " \
+  "import -window root /tmp/wyt-shot.png 2>/dev/null; " \
+  "echo SHOTDONE"
+#define SHOT_PATH "/tmp/wyt-shot.png"
+// Max screenshot bytes to buffer (board has ~200KB free heap for this)
+#define SHOT_MAX_BYTES 180000
 
 // ─── Display pins ─────────────────────────────────────────────────────────────
 #define LCD_CS  6
@@ -77,6 +100,7 @@ static long     s_tg_offset = 0;
 static uint32_t s_start_ms;
 static char     s_last_text[512] = "";
 static bool     s_wifi_ok = false;
+static bool     s_target_discovered = false;  // true once host sent TARGET
 
 // SSH target config
 static char s_ssh_host[64]  = DEFAULT_SSH_HOST;
@@ -84,22 +108,29 @@ static char s_ssh_user[64]  = DEFAULT_SSH_USER;
 static char s_ssh_pass[128] = DEFAULT_SSH_PASS;
 static int  s_ssh_port      = DEFAULT_SSH_PORT;
 
-// SSH async job
+// SSH async job types
+#define JOB_NONE       0
+#define JOB_SHELL      1
+#define JOB_SCREENSHOT 2
+
 struct SshJob {
+    int  type;
     char cmd[512];
     long long chat_id;
     volatile bool pending;
     volatile bool done;
-    char result[2048];
+    char  result[2048];      // text output (JOB_SHELL + errors)
+    uint8_t *imgbuf;         // heap-allocated PNG bytes (JOB_SCREENSHOT)
+    size_t   imglen;
 };
 static SshJob s_ssh_job = {0};
 static SemaphoreHandle_t s_ssh_mutex;
+static SemaphoreHandle_t s_disp_mutex;
 
 // ─── Terminal buffer ──────────────────────────────────────────────────────────
 struct Line { char text[TERM_COLS+1]; uint16_t col; };
 static Line s_buf[TERM_LINES];
 static int  s_count = 0;
-static SemaphoreHandle_t s_disp_mutex;
 
 void set_brightness(uint8_t v){ bus->beginWrite(); bus->writeC8D8(0x51,v); bus->endWrite(); }
 
@@ -137,12 +168,11 @@ void draw_header(){
     if(xSemaphoreTake(s_disp_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
     gfx->fillRect(0,0,SCREEN_W,HEADER_H,C_DKGREEN);
     gfx->setTextColor(C_GREEN); gfx->setTextSize(1);
-    gfx->setCursor(4,9); gfx->print("WyTerminal v4");
+    gfx->setCursor(4,9); gfx->print("WyTerminal v4.1");
     gfx->setCursor(SCREEN_W-52,9);
-    gfx->setTextColor(s_wifi_ok?C_GREEN:C_GREY);
-    gfx->print(s_wifi_ok?"WiFi":"wifi");
-    gfx->setTextColor(C_ORANGE); gfx->print(" SSH");
-    gfx->setTextColor(C_PURPLE); gfx->print(" CDC");
+    gfx->setTextColor(s_wifi_ok?C_GREEN:C_GREY);   gfx->print(s_wifi_ok?"WiFi":"wifi");
+    gfx->setTextColor(C_ORANGE);  gfx->print(" SSH");
+    gfx->setTextColor(C_PURPLE);  gfx->print(" CDC");
     xSemaphoreGive(s_disp_mutex);
 }
 
@@ -152,8 +182,7 @@ void draw_footer(){
     gfx->fillRect(0,y,SCREEN_W,FOOTER_H,C_DKBLUE);
     gfx->setTextColor(C_GREY); gfx->setTextSize(1); gfx->setCursor(2,y+5);
     uint32_t up=(millis()-s_start_ms)/1000; char buf[48];
-    snprintf(buf,48,"%s@%s  up:%lus",
-        s_ssh_user, s_ssh_host, (unsigned long)up);
+    snprintf(buf,48,"%s@%.20s  %lus", s_ssh_user, s_ssh_host, (unsigned long)up);
     gfx->print(buf);
     xSemaphoreGive(s_disp_mutex);
 }
@@ -185,110 +214,172 @@ void hid_key(const String&combo){
     }
 }
 
-// ─── SSH execution (runs on ssh_task, not main loop) ─────────────────────────
-// Returns output string (truncated to 2000 chars). Called from ssh_task only.
-static String ssh_exec(const char *cmd){
-    // Init libssh
-    libssh_begin();
+// ─── SSH helpers ─────────────────────────────────────────────────────────────
+static ssh_session ssh_open_session(){
     ssh_session session = ssh_new();
-    if(!session) return "err:ssh_new failed";
+    if(!session) return NULL;
+    int port    = s_ssh_port;
+    int timeout = 20;
+    int verb    = SSH_LOG_NOLOG;
+    ssh_options_set(session, SSH_OPTIONS_HOST,          s_ssh_host);
+    ssh_options_set(session, SSH_OPTIONS_USER,          s_ssh_user);
+    ssh_options_set(session, SSH_OPTIONS_PORT,          &port);
+    ssh_options_set(session, SSH_OPTIONS_TIMEOUT,       &timeout);
+    ssh_options_set(session, SSH_OPTIONS_LOG_VERBOSITY, &verb);
+    // TOFU — auto-accept unknown hosts
+    ssh_options_set(session, SSH_OPTIONS_KNOWNHOSTS,    "/dev/null");
 
-    int port = s_ssh_port;
-    int timeout = 15;
-    int verbosity = SSH_LOG_NOLOG;
-    ssh_options_set(session, SSH_OPTIONS_HOST,            s_ssh_host);
-    ssh_options_set(session, SSH_OPTIONS_USER,            s_ssh_user);
-    ssh_options_set(session, SSH_OPTIONS_PORT,            &port);
-    ssh_options_set(session, SSH_OPTIONS_TIMEOUT,         &timeout);
-    ssh_options_set(session, SSH_OPTIONS_LOG_VERBOSITY,   &verbosity);
-    // Disable strict host key checking (auto-accept new hosts)
-    ssh_options_set(session, SSH_OPTIONS_KNOWNHOSTS,      "/dev/null");
-
-    int rc = ssh_connect(session);
-    if(rc != SSH_OK){
-        String e = String("err:connect ") + ssh_get_error(session);
-        ssh_free(session);
-        return e;
+    if(ssh_connect(session) != SSH_OK){
+        ssh_free(session); return NULL;
     }
-
-    // Auto-accept host key (TOFU — Trust On First Use)
     ssh_session_update_known_hosts(session);
 
-    // Auth: try password if set, else try auto publickey
+    int rc;
     if(s_ssh_pass[0]){
         rc = ssh_userauth_password(session, NULL, s_ssh_pass);
     } else {
         rc = ssh_userauth_publickey_auto(session, NULL, NULL);
+        if(rc != SSH_AUTH_SUCCESS)
+            rc = ssh_userauth_password(session, NULL, "");
     }
     if(rc != SSH_AUTH_SUCCESS){
-        // Try password with empty string as last resort
-        rc = ssh_userauth_password(session, NULL, "");
-        if(rc != SSH_AUTH_SUCCESS){
-            String e = String("err:auth ") + ssh_get_error(session);
-            ssh_disconnect(session);
-            ssh_free(session);
-            return e;
-        }
+        ssh_disconnect(session); ssh_free(session); return NULL;
     }
+    return session;
+}
 
-    // Open channel and exec
-    ssh_channel channel = ssh_channel_new(session);
-    if(!channel){
-        ssh_disconnect(session); ssh_free(session);
-        return "err:channel_new";
+// Run a command, return stdout+stderr as String
+static String ssh_exec_cmd(ssh_session session, const char *cmd){
+    ssh_channel ch = ssh_channel_new(session);
+    if(!ch) return "err:channel";
+    if(ssh_channel_open_session(ch) != SSH_OK){
+        ssh_channel_free(ch); return "err:open";
     }
-    rc = ssh_channel_open_session(channel);
-    if(rc != SSH_OK){
-        ssh_channel_free(channel); ssh_disconnect(session); ssh_free(session);
-        return "err:channel_open";
+    if(ssh_channel_request_exec(ch, cmd) != SSH_OK){
+        ssh_channel_close(ch); ssh_channel_free(ch); return "err:exec";
     }
-    rc = ssh_channel_request_exec(channel, cmd);
-    if(rc != SSH_OK){
-        ssh_channel_close(channel); ssh_channel_free(channel);
-        ssh_disconnect(session); ssh_free(session);
-        return "err:exec";
+    char buf[256]; String out=""; int n;
+    while((n=ssh_channel_read_timeout(ch,buf,sizeof(buf)-1,0,15000))>0){
+        buf[n]=0; out+=buf; if(out.length()>2000){out+="\n[truncated]";break;}
     }
+    while((n=ssh_channel_read_timeout(ch,buf,sizeof(buf)-1,1,2000))>0){
+        buf[n]=0; out+=buf; if(out.length()>2000){out+="\n[truncated]";break;}
+    }
+    ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
+    return out.length()?out:"(no output)";
+}
 
-    // Read output (stdout + stderr)
-    char buf[256];
-    String output = "";
-    int nbytes;
-    while((nbytes = ssh_channel_read_timeout(channel, buf, sizeof(buf)-1, 0, 10000)) > 0){
-        buf[nbytes] = 0;
-        output += buf;
-        if(output.length() > 2000){ output += "\n[truncated]"; break; }
-    }
-    // Also read stderr
-    while((nbytes = ssh_channel_read_timeout(channel, buf, sizeof(buf)-1, 1, 1000)) > 0){
-        buf[nbytes] = 0;
-        output += buf;
-        if(output.length() > 2000){ output += "\n[truncated]"; break; }
-    }
+// Read a file from target by base64-encoding it through SSH exec.
+// Returns decoded byte count, or -1 on failure.
+// Much simpler than SFTP — works with any SSH server, no extra protocol.
+static const char b64chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static int b64val(char c){
+    if(c>='A'&&c<='Z') return c-'A';
+    if(c>='a'&&c<='z') return c-'a'+26;
+    if(c>='0'&&c<='9') return c-'0'+52;
+    if(c=='+') return 62; if(c=='/') return 63;
+    return -1;
+}
 
-    ssh_channel_send_eof(channel);
-    ssh_channel_close(channel);
-    ssh_channel_free(channel);
-    ssh_disconnect(session);
-    ssh_free(session);
+static int ssh_read_file_b64(ssh_session session, const char *path,
+                              uint8_t **outbuf, size_t maxbytes){
+    // Run: base64 <file> on the target
+    char cmd[256]; snprintf(cmd,sizeof(cmd),"base64 %s",path);
+    ssh_channel ch = ssh_channel_new(session);
+    if(!ch) return -1;
+    if(ssh_channel_open_session(ch)!=SSH_OK){ ssh_channel_free(ch); return -1; }
+    if(ssh_channel_request_exec(ch,cmd)!=SSH_OK){
+        ssh_channel_close(ch); ssh_channel_free(ch); return -1;
+    }
+    // Read base64 text
+    String b64=""; char buf[256]; int n;
+    while((n=ssh_channel_read_timeout(ch,buf,sizeof(buf)-1,0,20000))>0){
+        buf[n]=0; b64+=buf;
+        if(b64.length()>maxbytes*2) break;  // sanity limit
+    }
+    ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
+    if(!b64.length()) return -1;
 
-    if(output.length() == 0) output = "(no output)";
-    return output;
+    // Decode base64
+    size_t est = (b64.length()*3)/4 + 4;
+    uint8_t *raw = (uint8_t*)malloc(min(est,maxbytes));
+    if(!raw) return -1;
+    size_t out=0; int i=0; int len=b64.length();
+    while(i<len && out<maxbytes){
+        // skip whitespace
+        while(i<len && (b64[i]=='\n'||b64[i]=='\r'||b64[i]==' ')) i++;
+        if(i+3>=len) break;
+        int a=b64val(b64[i]),b=b64val(b64[i+1]),c=b64val(b64[i+2]),d=b64val(b64[i+3]);
+        i+=4;
+        if(a<0||b<0) break;
+        raw[out++]=(a<<2)|(b>>4);
+        if(c>=0&&out<maxbytes) raw[out++]=((b&0xF)<<4)|(c>>2);
+        if(d>=0&&out<maxbytes) raw[out++]=((c&0x3)<<6)|d;
+    }
+    if(out==0){ free(raw); return -1; }
+    *outbuf=raw; return (int)out;
 }
 
 // ─── SSH FreeRTOS task ────────────────────────────────────────────────────────
-// Runs at high priority, waits for jobs, executes SSH, stores result
 void ssh_task(void *pv){
     while(1){
         if(s_ssh_job.pending && !s_ssh_job.done){
-            term_ssh(s_ssh_job.cmd);
-            String out = ssh_exec(s_ssh_job.cmd);
-            // Store result
-            if(xSemaphoreTake(s_ssh_mutex, portMAX_DELAY) == pdTRUE){
-                strncpy(s_ssh_job.result, out.c_str(), sizeof(s_ssh_job.result)-1);
-                s_ssh_job.result[sizeof(s_ssh_job.result)-1] = 0;
-                s_ssh_job.done = true;
-                s_ssh_job.pending = false;
-                xSemaphoreGive(s_ssh_mutex);
+            // Open session
+            libssh_begin();
+            ssh_session session = ssh_open_session();
+            if(!session){
+                if(xSemaphoreTake(s_ssh_mutex, portMAX_DELAY)==pdTRUE){
+                    strncpy(s_ssh_job.result,"err:SSH connect failed",sizeof(s_ssh_job.result)-1);
+                    s_ssh_job.done=true; s_ssh_job.pending=false;
+                    xSemaphoreGive(s_ssh_mutex);
+                }
+                vTaskDelay(pdMS_TO_TICKS(100)); continue;
+            }
+
+            if(s_ssh_job.type == JOB_SHELL){
+                String out = ssh_exec_cmd(session, s_ssh_job.cmd);
+                ssh_disconnect(session); ssh_free(session);
+                if(xSemaphoreTake(s_ssh_mutex, portMAX_DELAY)==pdTRUE){
+                    strncpy(s_ssh_job.result, out.c_str(), sizeof(s_ssh_job.result)-1);
+                    s_ssh_job.result[sizeof(s_ssh_job.result)-1]=0;
+                    s_ssh_job.imgbuf=NULL; s_ssh_job.imglen=0;
+                    s_ssh_job.done=true; s_ssh_job.pending=false;
+                    xSemaphoreGive(s_ssh_mutex);
+                }
+
+            } else if(s_ssh_job.type == JOB_SCREENSHOT){
+                // 1. Run screenshot command on target
+                term_ssh("capturing...");
+                String out = ssh_exec_cmd(session, SHOT_CMD);
+                if(out.indexOf("SHOTDONE") < 0){
+                    ssh_disconnect(session); ssh_free(session);
+                    if(xSemaphoreTake(s_ssh_mutex, portMAX_DELAY)==pdTRUE){
+                        strncpy(s_ssh_job.result,"err:screenshot cmd failed",sizeof(s_ssh_job.result)-1);
+                        s_ssh_job.done=true; s_ssh_job.pending=false;
+                        xSemaphoreGive(s_ssh_mutex);
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(100)); continue;
+                }
+                // 2. SCP the PNG back
+                term_ssh("fetching PNG...");
+                uint8_t *imgbuf = NULL;
+                int imglen = ssh_read_file_b64(session, SHOT_PATH, &imgbuf, SHOT_MAX_BYTES);
+                // 3. Cleanup temp file on target
+                ssh_exec_cmd(session, "rm -f " SHOT_PATH);
+                ssh_disconnect(session); ssh_free(session);
+
+                if(xSemaphoreTake(s_ssh_mutex, portMAX_DELAY)==pdTRUE){
+                    if(imglen > 0){
+                        s_ssh_job.imgbuf = imgbuf;
+                        s_ssh_job.imglen = (size_t)imglen;
+                        strncpy(s_ssh_job.result,"ok:screenshot",sizeof(s_ssh_job.result)-1);
+                    } else {
+                        strncpy(s_ssh_job.result,"err:could not fetch PNG (no display?)",sizeof(s_ssh_job.result)-1);
+                        if(imgbuf) free(imgbuf);
+                    }
+                    s_ssh_job.done=true; s_ssh_job.pending=false;
+                    xSemaphoreGive(s_ssh_mutex);
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -299,7 +390,7 @@ void ssh_task(void *pv){
 String tg_post(const char*method, const String&body){
     WiFiClientSecure tls; tls.setInsecure();
     if(!tls.connect("api.telegram.org",443)) return "";
-    String path = String("/bot") + BOT_TOKEN + "/" + method;
+    String path=String("/bot")+BOT_TOKEN+"/"+method;
     tls.println("POST "+path+" HTTP/1.1");
     tls.println("Host: api.telegram.org");
     tls.println("Content-Type: application/json");
@@ -310,77 +401,136 @@ String tg_post(const char*method, const String&body){
     while(tls.connected()&&millis()-t<8000) while(tls.available()) resp+=(char)tls.read();
     tls.stop();
     int idx=resp.indexOf("\r\n\r\n");
-    return idx>=0 ? resp.substring(idx+4) : "";
+    return idx>=0?resp.substring(idx+4):"";
 }
 
 void tg_send(long long chat_id, const char*text){
-    // Split into ≤4096 char chunks if needed
-    String full = String(text);
-    int len = full.length();
-    int pos = 0;
-    while(pos < len){
-        String chunk = full.substring(pos, min(pos+4000, len));
-        StaticJsonDocument<512> doc;
-        doc["chat_id"] = chat_id;
-        doc["text"] = chunk;
-        String body; serializeJson(doc, body);
-        tg_post("sendMessage", body);
-        pos += 4000;
-        if(pos < len) delay(200);
+    String full=String(text); int len=full.length(); int pos=0;
+    while(pos<len){
+        String chunk=full.substring(pos,min(pos+4000,len));
+        StaticJsonDocument<512> doc; doc["chat_id"]=chat_id; doc["text"]=chunk;
+        String body; serializeJson(doc,body); tg_post("sendMessage",body);
+        pos+=4000; if(pos<len) delay(200);
     }
 }
 
-// ─── SSH job dispatcher (called from main loop to check completed jobs) ───────
-static long long s_pending_chat_id = 0;
-static bool      s_ssh_reply_pending = false;
+// Send PNG bytes as a Telegram photo via multipart/form-data
+void tg_send_photo(long long chat_id, uint8_t *png, size_t len, const char *caption){
+    WiFiClientSecure tls; tls.setInsecure();
+    if(!tls.connect("api.telegram.org",443)){
+        tg_send(chat_id,"err:TLS connect failed for photo"); return;
+    }
+    String boundary="----WyT4Boundary";
+    // Build header part
+    String hdr="";
+    hdr+="--"+boundary+"\r\n";
+    hdr+="Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n";
+    hdr+=String((long long)chat_id)+"\r\n";
+    hdr+="--"+boundary+"\r\n";
+    hdr+="Content-Disposition: form-data; name=\"caption\"\r\n\r\n";
+    hdr+=String(caption)+"\r\n";
+    hdr+="--"+boundary+"\r\n";
+    hdr+="Content-Disposition: form-data; name=\"photo\"; filename=\"screenshot.png\"\r\n";
+    hdr+="Content-Type: image/png\r\n\r\n";
+    String tail="\r\n--"+boundary+"--\r\n";
+    size_t total=hdr.length()+len+tail.length();
+
+    String path=String("/bot")+BOT_TOKEN+"/sendPhoto";
+    tls.println("POST "+path+" HTTP/1.1");
+    tls.println("Host: api.telegram.org");
+    tls.println("Content-Type: multipart/form-data; boundary="+boundary);
+    tls.println("Content-Length: "+String(total));
+    tls.println("Connection: close"); tls.println();
+    tls.print(hdr);
+    // Send PNG in chunks
+    size_t sent=0;
+    while(sent<len){ size_t chunk=min((size_t)1024,len-sent); tls.write(png+sent,chunk); sent+=chunk; }
+    tls.print(tail);
+    // Drain response
+    uint32_t t=millis();
+    while(tls.connected()&&millis()-t<10000) while(tls.available()) tls.read();
+    tls.stop();
+}
+
+// ─── SSH job dispatcher + result checker ──────────────────────────────────────
+static long long s_pending_chat_id=0;
+static bool      s_ssh_reply_pending=false;
 
 void check_ssh_result(){
     if(!s_ssh_reply_pending) return;
-    bool done = false;
-    char result[2048] = {0};
-    if(xSemaphoreTake(s_ssh_mutex, pdMS_TO_TICKS(50)) == pdTRUE){
+    bool done=false; int type=JOB_NONE;
+    char result[2048]={0}; uint8_t *imgbuf=NULL; size_t imglen=0;
+
+    if(xSemaphoreTake(s_ssh_mutex, pdMS_TO_TICKS(50))==pdTRUE){
         if(s_ssh_job.done){
-            done = true;
-            strncpy(result, s_ssh_job.result, sizeof(result)-1);
-            s_ssh_job.done = false;
+            done=true; type=s_ssh_job.type;
+            strncpy(result,s_ssh_job.result,sizeof(result)-1);
+            imgbuf=s_ssh_job.imgbuf; imglen=s_ssh_job.imglen;
+            s_ssh_job.imgbuf=NULL; s_ssh_job.imglen=0;
+            s_ssh_job.done=false;
         }
         xSemaphoreGive(s_ssh_mutex);
     }
-    if(done){
-        s_ssh_reply_pending = false;
-        term_ok("ssh done");
+    if(!done) return;
+    s_ssh_reply_pending=false;
+
+    if(type==JOB_SCREENSHOT && imgbuf && imglen>0){
+        term_ok("sending photo...");
+        char cap[80]; snprintf(cap,80,"📸 %s@%s",s_ssh_user,s_ssh_host);
+        tg_send_photo(s_pending_chat_id, imgbuf, imglen, cap);
+        free(imgbuf);
+        term_ok("photo sent");
+    } else {
         tg_send(s_pending_chat_id, result);
+        term_ok("ssh done");
     }
 }
 
-void dispatch_ssh(const char *cmd, long long chat_id){
-    if(s_ssh_job.pending || s_ssh_reply_pending){
-        tg_send(chat_id, "err:ssh busy — try again");
-        return;
+void dispatch_ssh(int type, const char *cmd, long long chat_id){
+    if(s_ssh_job.pending||s_ssh_reply_pending){
+        tg_send(chat_id,"err:ssh busy — try again"); return;
     }
-    strncpy(s_ssh_job.cmd, cmd, sizeof(s_ssh_job.cmd)-1);
-    s_ssh_job.cmd[sizeof(s_ssh_job.cmd)-1] = 0;
-    s_ssh_job.chat_id = chat_id;
-    s_ssh_job.done = false;
-    s_ssh_job.pending = true;
-    s_pending_chat_id = chat_id;
-    s_ssh_reply_pending = true;
-    char disp[40]; snprintf(disp,40,"ssh: %.36s",cmd);
-    term_ssh(disp);
-    tg_send(chat_id, "⏳ running...");
+    s_ssh_job.type=type;
+    strncpy(s_ssh_job.cmd, cmd?cmd:"", sizeof(s_ssh_job.cmd)-1);
+    s_ssh_job.chat_id=chat_id;
+    s_ssh_job.imgbuf=NULL; s_ssh_job.imglen=0;
+    s_ssh_job.done=false; s_ssh_job.pending=true;
+    s_pending_chat_id=chat_id; s_ssh_reply_pending=true;
+    if(type==JOB_SCREENSHOT) tg_send(chat_id,"⏳ capturing screenshot...");
+    else tg_send(chat_id,"⏳ running...");
+}
+
+// ─── Target auto-discovery ────────────────────────────────────────────────────
+// Called when host sends: TARGET user@host[:port]
+void apply_target(const String &arg){
+    int at=arg.indexOf('@');
+    if(at<0) return;
+    String user=arg.substring(0,at);
+    String hostport=arg.substring(at+1); hostport.trim();
+    int colon=hostport.indexOf(':');
+    String host=colon>=0?hostport.substring(0,colon):hostport;
+    int port=colon>=0?hostport.substring(colon+1).toInt():22;
+    user.trim(); host.trim();
+    if(!user.length()||!host.length()) return;
+    strncpy(s_ssh_user,user.c_str(),sizeof(s_ssh_user)-1);
+    strncpy(s_ssh_host,host.c_str(),sizeof(s_ssh_host)-1);
+    s_ssh_port=port; s_ssh_pass[0]=0;
+    s_target_discovered=true;
+    draw_footer();
+    char msg[64]; snprintf(msg,64,"auto: %s@%s",s_ssh_user,s_ssh_host);
+    term_ok(msg);
 }
 
 // ─── Command handler ──────────────────────────────────────────────────────────
-// Returns response string. Async commands (SSH) return immediately; result sent later.
 String handle_cmd(const String&t, bool send_tg, long long chat_id){
-    String short_t = t.length()>30 ? t.substring(0,29)+">" : t;
+    String short_t=t.length()>30?t.substring(0,29)+">":t;
     term_cmd(short_t.c_str());
 
-    // HID commands
+    // HID
     if(t.startsWith("/run ")){
         String cmd=t.substring(5); hid_type(cmd.c_str(),true);
         if(send_tg){ String m="▶️ "+cmd; tg_send(chat_id,m.c_str()); }
-        term_ok("sent"); return "ok:run";
+        term_ok("sent"); return "";
     }
     if(t.startsWith("/type ")){
         String s=t.substring(6);
@@ -406,63 +556,56 @@ String handle_cmd(const String&t, bool send_tg, long long chat_id){
     if(t.startsWith("/shell ")){
         if(!s_wifi_ok){ term_err("no wifi"); return "err:no wifi"; }
         String cmd=t.substring(7); cmd.trim();
-        dispatch_ssh(cmd.c_str(), chat_id);
-        return "";  // response sent async
+        dispatch_ssh(JOB_SHELL, cmd.c_str(), chat_id);
+        return "";
+    }
+    if(t=="/screenshot"){
+        if(!s_wifi_ok){ term_err("no wifi"); return "err:no wifi"; }
+        dispatch_ssh(JOB_SCREENSHOT, NULL, chat_id);
+        return "";
     }
     if(t.startsWith("/target ")){
-        // /target user@host[:port]
         String arg=t.substring(8); arg.trim();
-        int at=arg.indexOf('@');
-        if(at<0){ term_err("fmt: user@host"); return "err:format — use user@host"; }
-        String user=arg.substring(0,at);
-        String hostport=arg.substring(at+1);
-        int colon=hostport.indexOf(':');
-        String host=colon>=0?hostport.substring(0,colon):hostport;
-        int port=colon>=0?hostport.substring(colon+1).toInt():22;
-        strncpy(s_ssh_user, user.c_str(), sizeof(s_ssh_user)-1);
-        strncpy(s_ssh_host, host.c_str(), sizeof(s_ssh_host)-1);
-        s_ssh_port=port; s_ssh_pass[0]=0;
-        draw_footer();
-        String resp="🎯 target: "+user+"@"+host+":"+String(port);
-        term_ok(resp.c_str());
+        apply_target(arg);
+        String resp="🎯 target: "+String(s_ssh_user)+"@"+String(s_ssh_host)+":"+String(s_ssh_port);
         return resp;
     }
     if(t.startsWith("/ssh_pass ")){
         String pass=t.substring(10);
-        strncpy(s_ssh_pass, pass.c_str(), sizeof(s_ssh_pass)-1);
-        term_ok("pass set");
-        return "ok:password stored";
+        strncpy(s_ssh_pass,pass.c_str(),sizeof(s_ssh_pass)-1);
+        term_ok("pass set"); return "ok:password stored";
     }
 
     // Info
     if(t=="/status"){
         uint32_t up=(millis()-s_start_ms)/1000; char buf[256];
         snprintf(buf,256,
-            "WyTerminal v4\n"
+            "WyTerminal v4.1\n"
             "WiFi: %s\n"
             "Target: %s@%s:%d\n"
             "Auth: %s\n"
+            "Discovery: %s\n"
             "Uptime: %lus",
             s_wifi_ok?WiFi.localIP().toString().c_str():"off",
             s_ssh_user, s_ssh_host, s_ssh_port,
             s_ssh_pass[0]?"password":"publickey/none",
+            s_target_discovered?"auto":"default",
             (unsigned long)up);
         term_info("status"); return String(buf);
     }
     if(t=="/help"){
         return
-            "WyTerminal v4 commands:\n"
-            "/run <text>         — HID type+enter\n"
-            "/type <text>        — HID type (no enter)\n"
-            "/enter              — press Enter\n"
-            "/paste              — retype last /type text\n"
-            "/key <combo>        — e.g. ctrl+c, ctrl+alt+t\n"
-            "/clear              — clear display\n"
-            "/shell <cmd>        — SSH to target, run cmd\n"
-            "/target user@host   — switch SSH target\n"
-            "/ssh_pass <pass>    — set SSH password\n"
-            "/status             — show status\n"
-            "/help               — this message";
+            "WyTerminal v4.1\n"
+            "/run <text>       — HID type+enter\n"
+            "/type <text>      — HID type\n"
+            "/enter /paste     — enter / repeat\n"
+            "/key <combo>      — ctrl+c, ctrl+alt+t…\n"
+            "/clear            — clear display\n"
+            "/shell <cmd>      — SSH exec on target\n"
+            "/screenshot       — capture+send screen\n"
+            "/target user@host — switch target\n"
+            "/ssh_pass <pass>  — set SSH password\n"
+            "/status           — show status";
     }
 
     term_err("unknown"); return "err:unknown";
@@ -478,17 +621,16 @@ void poll_telegram(){
     DynamicJsonDocument doc(8192);
     if(deserializeJson(doc,resp)) return;
     if(!doc["ok"]) return;
-    for(JsonObject upd : doc["result"].as<JsonArray>()){
+    for(JsonObject upd:doc["result"].as<JsonArray>()){
         long uid=upd["update_id"]; if(uid>s_tg_offset) s_tg_offset=uid;
         if(!upd.containsKey("message")) continue;
         JsonObject msg=upd["message"];
         long long cid=msg["chat"]["id"]; if(cid!=ALLOWED_CHAT_ID) continue;
         const char*text=msg["text"]|""; if(!text[0]) continue;
-        // Strip @BotUsername suffix from commands
         String tcmd=String(text);
         int at_idx=tcmd.indexOf('@'); if(at_idx>0) tcmd=tcmd.substring(0,at_idx);
         String r=handle_cmd(tcmd,true,cid);
-        if(r.length()) tg_send(cid, r.c_str());
+        if(r.length()) tg_send(cid,r.c_str());
     }
 }
 
@@ -500,9 +642,16 @@ void handle_cdc(){
         if(c=='\n'||c=='\r'){
             s_cdc_buf.trim();
             if(s_cdc_buf.length()){
-                term_sys(s_cdc_buf.c_str());
-                String resp=handle_cmd(s_cdc_buf,false,0);
-                if(resp.length()) Serial.println(resp);
+                // Auto-discovery: host sends "TARGET user@host"
+                if(s_cdc_buf.startsWith("TARGET ")){
+                    String arg=s_cdc_buf.substring(7);
+                    apply_target(arg);
+                    Serial.println("ok:target_set");
+                } else {
+                    term_sys(s_cdc_buf.c_str());
+                    String resp=handle_cmd(s_cdc_buf,false,0);
+                    if(resp.length()) Serial.println(resp);
+                }
             }
             s_cdc_buf="";
         } else { s_cdc_buf+=c; }
@@ -512,32 +661,27 @@ void handle_cdc(){
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup(){
     Serial.begin(115200);
-
-    // Display
     pinMode(LCD_PWR,OUTPUT); digitalWrite(LCD_PWR,HIGH); delay(50);
     if(!gfx->begin()){ Serial.println("Display fail"); while(1) delay(1000); }
     set_brightness(200);
-    gfx->fillScreen(C_BG);
-    gfx->setTextSize(1);
-    gfx->setTextWrap(false);
+    gfx->fillScreen(C_BG); gfx->setTextSize(1); gfx->setTextWrap(false);
 
-    // Mutexes
     s_disp_mutex = xSemaphoreCreateMutex();
     s_ssh_mutex  = xSemaphoreCreateMutex();
 
     draw_header(); draw_footer();
-    term_head("WyTerminal v4.0");
-    term_sys("Onboard SSH — no relay");
+    term_head("WyTerminal v4.1");
+    term_sys("SSH + auto-discover");
     term_info("by Wyltek Industries");
     term_info("────────────────────");
 
-    // USB HID + CDC
     USB.begin(); Keyboard.begin(); delay(200);
     term_ok("USB HID + CDC ready");
+    // Signal host that we're ready for TARGET announcement
+    Serial.println("WYTERMINAL_HELLO");
+    term_info("waiting for TARGET...");
 
-    // WiFi
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
     term_info("WiFi connecting...");
     uint32_t t0=millis();
     while(WiFi.status()!=WL_CONNECTED && millis()-t0<20000) delay(500);
@@ -546,20 +690,19 @@ void setup(){
         s_wifi_ok=true; draw_header();
         char buf[48]; snprintf(buf,48,"%s",WiFi.localIP().toString().c_str());
         term_ok(buf);
-        // Init libssh (must happen after WiFi)
         libssh_begin();
         term_ok("SSH engine ready");
-        char tgt[80]; snprintf(tgt,80,"tgt: %s@%s",s_ssh_user,s_ssh_host);
-        term_ssh(tgt);
         term_ok("Telegram ready");
     } else {
         term_info("WiFi off — CDC+HID only");
     }
+    if(!s_target_discovered){
+        char tgt[80]; snprintf(tgt,80,"default: %s@%s",s_ssh_user,s_ssh_host);
+        term_ssh(tgt);
+    }
     draw_footer();
 
-    // SSH FreeRTOS task (high stack — libssh needs ~32KB)
-    xTaskCreatePinnedToCore(ssh_task, "ssh", 32768, NULL,
-        (tskIDLE_PRIORITY + 2), NULL, 0);
+    xTaskCreatePinnedToCore(ssh_task,"ssh",32768,NULL,(tskIDLE_PRIORITY+2),NULL,0);
 }
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────
@@ -567,24 +710,16 @@ static uint32_t s_last_footer=0, s_last_tg=0;
 
 void loop(){
     handle_cdc();
-
     if(s_wifi_ok){
-        // Check for completed SSH jobs
         check_ssh_result();
-
-        // Poll Telegram every 2s
-        if(millis()-s_last_tg > 2000){
-            if(WiFi.status()!=WL_CONNECTED){
-                s_wifi_ok=false; draw_header(); WiFi.reconnect();
-            } else {
-                poll_telegram();
-            }
+        if(millis()-s_last_tg>2000){
+            if(WiFi.status()!=WL_CONNECTED){ s_wifi_ok=false; draw_header(); WiFi.reconnect(); }
+            else poll_telegram();
             s_last_tg=millis();
         }
     } else if(WiFi.status()==WL_CONNECTED){
         s_wifi_ok=true; draw_header();
     }
-
-    if(millis()-s_last_footer > 5000){ draw_footer(); s_last_footer=millis(); }
+    if(millis()-s_last_footer>5000){ draw_footer(); s_last_footer=millis(); }
     delay(50);
 }
