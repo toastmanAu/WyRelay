@@ -267,12 +267,15 @@ static ssh_session ssh_open_session(){
     ssh_options_set(session, SSH_OPTIONS_PORT,          &port);
     ssh_options_set(session, SSH_OPTIONS_TIMEOUT,       &timeout);
     ssh_options_set(session, SSH_OPTIONS_LOG_VERBOSITY, &verb);
-    // TOFU — auto-accept unknown hosts
-    ssh_options_set(session, SSH_OPTIONS_KNOWNHOSTS,    "/dev/null");
+    // TOFU — auto-accept unknown hosts (no host key verification)
+    int stricthostcheck = 0;
+    ssh_options_set(session, SSH_OPTIONS_STRICTHOSTKEYCHECK, &stricthostcheck);
+    ssh_options_set(session, SSH_OPTIONS_KNOWNHOSTS, "/spiffs/.ssh/known_hosts");
 
     if(ssh_connect(session) != SSH_OK){
         ssh_free(session); return NULL;
     }
+    // Auto-add host to known_hosts (TOFU)
     ssh_session_update_known_hosts(session);
 
     // Tell libssh where our private key lives on SPIFFS
