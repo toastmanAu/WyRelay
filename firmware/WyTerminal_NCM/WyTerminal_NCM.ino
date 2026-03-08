@@ -1,5 +1,5 @@
 /*
- * WyTerminal v4.1 — LilyGO T-Display S3 AMOLED
+ * WyTerminal v4.2 — LilyGO T-Display S3 AMOLED
  * USB HID Keyboard + WiFi Telegram + Onboard SSH
  *
  * v4.1 additions over v4:
@@ -33,6 +33,7 @@
 #include <Arduino_GFX_Library.h>
 #include "libssh_esp32.h"
 #include <libssh/libssh.h>
+#include "SPIFFS.h"
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 #define WIFI_SSID        "D-Link the router"
@@ -57,6 +58,10 @@
 #define SHOT_PATH "/tmp/wyt-shot.png"
 // Max screenshot bytes to buffer (board has ~200KB free heap for this)
 #define SHOT_MAX_BYTES 180000
+
+// SSH key paths on SPIFFS
+#define SSH_KEY_PATH  "/spiffs/.ssh/id_ed25519"
+#define SSH_PUBKEY_PATH "/spiffs/.ssh/id_ed25519.pub"
 
 // ─── Display pins ─────────────────────────────────────────────────────────────
 #define LCD_CS  6
@@ -101,6 +106,7 @@ static uint32_t s_start_ms;
 static char     s_last_text[512] = "";
 static bool     s_wifi_ok = false;
 static bool     s_target_discovered = false;  // true once host sent TARGET
+static char     s_pubkey_b64[512] = "";            // our ed25519 public key (base64 blob)
 
 // SSH target config
 static char s_ssh_host[64]  = DEFAULT_SSH_HOST;
@@ -168,7 +174,7 @@ void draw_header(){
     if(xSemaphoreTake(s_disp_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
     gfx->fillRect(0,0,SCREEN_W,HEADER_H,C_DKGREEN);
     gfx->setTextColor(C_GREEN); gfx->setTextSize(1);
-    gfx->setCursor(4,9); gfx->print("WyTerminal v4.1");
+    gfx->setCursor(4,9); gfx->print("WyTerminal v4.2");
     gfx->setCursor(SCREEN_W-52,9);
     gfx->setTextColor(s_wifi_ok?C_GREEN:C_GREY);   gfx->print(s_wifi_ok?"WiFi":"wifi");
     gfx->setTextColor(C_ORANGE);  gfx->print(" SSH");
@@ -214,6 +220,41 @@ void hid_key(const String&combo){
     }
 }
 
+// ─── SSH keypair management ───────────────────────────────────────────────────
+// Generate ed25519 keypair on first boot, store in SPIFFS.
+// Exports the public key blob into s_pubkey_b64.
+static void init_ssh_keys(){
+    if(!SPIFFS.begin(true)){
+        term_err("SPIFFS mount fail"); return;
+    }
+    ssh_key privkey = NULL;
+    bool have_key = SPIFFS.exists(SSH_KEY_PATH);
+    if(have_key){
+        int rc = ssh_pki_import_privkey_file(SSH_KEY_PATH, NULL, NULL, NULL, &privkey);
+        if(rc != SSH_OK){ have_key = false; privkey = NULL; }
+    }
+    if(!privkey){
+        term_info("generating ed25519 key...");
+        int rc = ssh_pki_generate(SSH_KEYTYPE_ED25519, 0, &privkey);
+        if(rc != SSH_OK || !privkey){ term_err("keygen failed"); return; }
+        ssh_pki_export_privkey_file(privkey, NULL, NULL, NULL, SSH_KEY_PATH);
+        term_ok("ed25519 key generated");
+    }
+    // Export public key as base64
+    ssh_key pubkey = NULL;
+    if(ssh_pki_export_privkey_to_pubkey(privkey, &pubkey) == SSH_OK){
+        char *b64 = NULL;
+        if(ssh_pki_export_pubkey_base64(pubkey, &b64) == SSH_OK && b64){
+            snprintf(s_pubkey_b64, sizeof(s_pubkey_b64), "ssh-ed25519 %s WyTerminal", b64);
+            SSH_STRING_FREE_CHAR(b64);
+        }
+        ssh_key_free(pubkey);
+    }
+    ssh_key_free(privkey);
+    if(s_pubkey_b64[0]) term_ok("pubkey ready");
+    else term_err("pubkey export failed");
+}
+
 // ─── SSH helpers ─────────────────────────────────────────────────────────────
 static ssh_session ssh_open_session(){
     ssh_session session = ssh_new();
@@ -234,10 +275,14 @@ static ssh_session ssh_open_session(){
     }
     ssh_session_update_known_hosts(session);
 
+    // Tell libssh where our private key lives on SPIFFS
+    ssh_options_set(session, SSH_OPTIONS_IDENTITY, SSH_KEY_PATH);
+
     int rc;
     if(s_ssh_pass[0]){
         rc = ssh_userauth_password(session, NULL, s_ssh_pass);
     } else {
+        // Try our generated key first, then auto, then empty password
         rc = ssh_userauth_publickey_auto(session, NULL, NULL);
         if(rc != SSH_AUTH_SUCCESS)
             rc = ssh_userauth_password(session, NULL, "");
@@ -576,11 +621,17 @@ String handle_cmd(const String&t, bool send_tg, long long chat_id){
         term_ok("pass set"); return "ok:password stored";
     }
 
+    // Show our public key
+    if(t=="/pubkey"){
+        if(s_pubkey_b64[0]) return String(s_pubkey_b64);
+        return "err:no key generated yet";
+    }
+
     // Info
     if(t=="/status"){
         uint32_t up=(millis()-s_start_ms)/1000; char buf[256];
         snprintf(buf,256,
-            "WyTerminal v4.1\n"
+            "WyTerminal v4.2\n"
             "WiFi: %s\n"
             "Target: %s@%s:%d\n"
             "Auth: %s\n"
@@ -595,7 +646,7 @@ String handle_cmd(const String&t, bool send_tg, long long chat_id){
     }
     if(t=="/help"){
         return
-            "WyTerminal v4.1\n"
+            "WyTerminal v4.2\n"
             "/run <text>       — HID type+enter\n"
             "/type <text>      — HID type\n"
             "/enter /paste     — enter / repeat\n"
@@ -647,6 +698,11 @@ void handle_cdc(){
                     String arg=s_cdc_buf.substring(7);
                     apply_target(arg);
                     Serial.println("ok:target_set");
+                    // Immediately broadcast our public key so host can install it
+                    if(s_pubkey_b64[0]){
+                        Serial.print("PUBKEY ");
+                        Serial.println(s_pubkey_b64);
+                    }
                 } else {
                     term_sys(s_cdc_buf.c_str());
                     String resp=handle_cmd(s_cdc_buf,false,0);
@@ -670,13 +726,15 @@ void setup(){
     s_ssh_mutex  = xSemaphoreCreateMutex();
 
     draw_header(); draw_footer();
-    term_head("WyTerminal v4.1");
+    term_head("WyTerminal v4.2");
     term_sys("SSH + auto-discover");
     term_info("by Wyltek Industries");
     term_info("────────────────────");
 
     USB.begin(); Keyboard.begin(); delay(200);
     term_ok("USB HID + CDC ready");
+    // Generate/load SSH keypair
+    init_ssh_keys();
     // Signal host that we're ready for TARGET announcement
     Serial.println("WYTERMINAL_HELLO");
     term_info("waiting for TARGET...");
